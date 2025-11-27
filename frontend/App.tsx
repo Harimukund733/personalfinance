@@ -4,12 +4,26 @@ import Dashboard from './components/Dashboard';
 import LoanManager from './components/LoanManager';
 import BudgetManager from './components/BudgetManager';
 import AIAdvisor from './components/AIAdvisor';
-import { Loan, Payment, Transaction } from './types';
-import { supabase, fetchUserData, saveUserData } from './services/supabaseService';
+import { Loan, Payment, Transaction, LoanType } from './types';
+import { 
+  supabase, 
+  fetchUserData, 
+  saveLoanToDb, 
+  deleteLoanFromDb, 
+  saveTransactionToDb, 
+  deleteTransactionFromDb,
+  savePaymentToDb,
+  subscribeToRealtime
+} from './services/supabaseService';
 import { LayoutDashboard, List, PieChart, Wallet, Sun, Moon, User, Bell, Volume2, XCircle } from 'lucide-react';
 import { getNextDueDate, AudioAlarm, generateUUID } from './utils';
 
 const App: React.FC = () => {
+  // Debug Log
+  useEffect(() => {
+    console.log("App mounted successfully");
+  }, []);
+
   const [activeTab, setActiveTab] = useState<'dashboard' | 'debts' | 'budget'>('dashboard');
   const [darkMode, setDarkMode] = useState(() => {
     return localStorage.getItem('theme') === 'dark';
@@ -26,7 +40,6 @@ const App: React.FC = () => {
       const saved = localStorage.getItem('finance_app_loans');
       if (!saved) return [];
       const parsed = JSON.parse(saved);
-      // Ensure all loans have valid string IDs immediately
       return Array.isArray(parsed) ? parsed.map((l: any) => ({
           ...l,
           id: l.id ? String(l.id).trim() : generateUUID()
@@ -67,12 +80,74 @@ const App: React.FC = () => {
   useEffect(() => {
     localStorage.setItem('finance_app_loans', JSON.stringify(loans));
     localStorage.setItem('finance_app_transactions', JSON.stringify(transactions));
-    
-    // Attempt cloud sync if connected
-    if (supabase) {
-      saveUserData(loans, transactions);
-    }
   }, [loans, transactions]);
+
+  // Auth & Cloud Load & Realtime
+  useEffect(() => {
+    if (supabase) {
+      supabase.auth.getUser().then(({ data }) => {
+        if (data.user) {
+          setUserEmail(data.user.email || "User");
+          
+          // 1. Initial Fetch
+          fetchUserData().then(d => {
+            if (d) {
+              setLoans(d.loans);
+              setTransactions(d.transactions);
+            }
+          });
+
+          // 2. Setup Realtime Listeners for "Live" Updates
+          
+          // Listen to Loans Table
+          const loanSub = subscribeToRealtime('loans', (eventType, payload) => {
+             console.log("Realtime Loan Event:", eventType, payload);
+             if (eventType === 'DELETE') {
+                 setLoans(prev => prev.filter(l => String(l.id) !== String(payload.id)));
+             } else {
+                 // For Insert/Update, simpler to refetch or map. 
+                 fetchUserData().then(d => d && setLoans(d.loans));
+             }
+          });
+
+          // Listen to Transactions Table
+          const txSub = subscribeToRealtime('transactions', (eventType, payload) => {
+             console.log("Realtime Tx Event:", eventType, payload);
+             if (eventType === 'DELETE') {
+                 setTransactions(prev => prev.filter(t => String(t.id) !== String(payload.id)));
+             } else {
+                 const newTx: Transaction = {
+                     id: payload.id,
+                     date: payload.date,
+                     amount: Number(payload.amount),
+                     type: payload.type,
+                     category: payload.category,
+                     description: payload.description
+                 };
+                 
+                 setTransactions(prev => {
+                     const exists = prev.find(t => t.id === newTx.id);
+                     if (exists) return prev.map(t => t.id === newTx.id ? newTx : t);
+                     return [...prev, newTx];
+                 });
+             }
+          });
+          
+          // Listen to Payments Table (Affects Loans)
+          const paySub = subscribeToRealtime('payments', () => {
+              // When a payment comes in, refetch loans to update balances
+              fetchUserData().then(d => d && setLoans(d.loans));
+          });
+
+          return () => {
+              if (loanSub) supabase.removeChannel(loanSub);
+              if (txSub) supabase.removeChannel(txSub);
+              if (paySub) supabase.removeChannel(paySub);
+          };
+        }
+      });
+    }
+  }, []);
 
   // Check for Notifications & Overdue Loans
   useEffect(() => {
@@ -123,37 +198,16 @@ const App: React.FC = () => {
     setAlarmPlaying(false);
   };
 
-  // Auth Check
-  useEffect(() => {
-    if (supabase) {
-      supabase.auth.getUser().then(({ data }) => {
-        if (data.user) {
-          setUserEmail(data.user.email || "User");
-          fetchUserData().then(d => {
-            if (d) {
-              // Merge or set? Setting for now, could be improved.
-              // Ensure we sanitize incoming cloud data too
-              if(d.loans.length > 0) {
-                  setLoans(d.loans.map(l => ({...l, id: String(l.id).trim()})));
-              }
-              if(d.transactions.length > 0) {
-                  setTransactions(d.transactions.map(t => ({...t, id: String(t.id).trim()})));
-              }
-            }
-          });
-        }
-      });
-    }
-  }, []);
-
   const addLoan = (loan: Loan) => {
     const newLoan = { ...loan, id: String(loan.id).trim() };
     setLoans(prev => [...prev, newLoan]);
+    if (supabase) saveLoanToDb(newLoan);
   };
 
   const updateLoan = (updatedLoan: Loan) => {
     const safeId = String(updatedLoan.id).trim();
     setLoans(prev => prev.map(l => String(l.id).trim() === safeId ? updatedLoan : l));
+    if (supabase) saveLoanToDb(updatedLoan);
   };
 
   const deleteLoan = (id: string) => {
@@ -165,18 +219,11 @@ const App: React.FC = () => {
     console.log("APP: Requesting delete for ID:", targetId);
     
     setLoans(prev => {
-        const initialCount = prev.length;
-        // Robust filtering: convert both to string and trim to be safe
         const filtered = prev.filter(l => String(l.id).trim() !== targetId);
-        
-        if (filtered.length === initialCount) {
-            console.warn(`APP: Delete operation did not remove any items. Target ID: ${targetId}. Available IDs:`, prev.map(p => p.id));
-        } else {
-            console.log(`APP: Deleted successfully. Count ${initialCount} -> ${filtered.length}`);
-        }
-        
         return filtered;
     });
+
+    if (supabase) deleteLoanFromDb(targetId);
   };
 
   const addPayment = (loanId: string, payment: Payment) => {
@@ -187,17 +234,20 @@ const App: React.FC = () => {
           }
           return l;
       }));
+      if (supabase) savePaymentToDb(targetId, payment);
   };
 
   const addTransaction = (transaction: Transaction) => {
     const newTx = { ...transaction, id: String(transaction.id).trim() };
     setTransactions(prev => [...prev, newTx]);
+    if (supabase) saveTransactionToDb(newTx);
   };
 
   const deleteTransaction = (id: string) => {
     if (!id) return;
     const targetId = String(id).trim();
     setTransactions(prev => prev.filter(t => String(t.id).trim() !== targetId));
+    if (supabase) deleteTransactionFromDb(targetId);
   };
 
   return (
@@ -228,7 +278,7 @@ const App: React.FC = () => {
             </h1>
           </div>
           <div className="flex items-center gap-3">
-             {supabase && <span className="hidden md:inline text-[10px] text-emerald-600 bg-emerald-50 dark:bg-emerald-900/30 dark:text-emerald-400 px-2 py-1 rounded-full border border-emerald-100 dark:border-emerald-800">Cloud Sync Active</span>}
+             {supabase && <span className="hidden md:inline text-[10px] text-emerald-600 bg-emerald-50 dark:bg-emerald-900/30 dark:text-emerald-400 px-2 py-1 rounded-full border border-emerald-100 dark:border-emerald-800">Live Sync Active</span>}
             
             <button
                 onClick={requestNotificationPermission}
